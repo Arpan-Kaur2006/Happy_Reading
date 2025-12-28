@@ -1,0 +1,395 @@
+<!DOCTYPE html>
+<html>
+
+<head>
+    <title>Reader</title>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/2.16.105/pdf.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.1.5/jszip.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/epubjs/dist/epub.min.js"></script>
+    <script src="storage.js"></script>
+
+    <style>
+        :root {
+            --bg-body: #fdfdfd;
+            --text-color: #333;
+            --font-family: 'Merriweather', 'Georgia', serif;
+        }
+
+        /* Themes */
+        body[data-theme="dark"] {
+            --bg-body: #1a1a1a;
+            --text-color: #d3d3d3;
+        }
+
+        body[data-theme="sepia"] {
+            --bg-body: #f4ecd8;
+            --text-color: #5b4636;
+        }
+
+        body {
+            margin: 0;
+            background-color: var(--bg-body);
+            color: var(--text-color);
+            font-family: var(--font-family);
+            line-height: 1.8;
+            transition: background 0.3s, color 0.3s;
+        }
+
+        /* Progress Bar */
+        #readingProgress {
+            position: fixed;
+            top: 0;
+            left: 0;
+            height: 4px;
+            background: #2563eb;
+            width: 0%;
+            z-index: 1000;
+            transition: width 0.1s;
+        }
+
+        /* Floating Settings Bar */
+        .toolbar {
+            position: fixed;
+            top: 20px;
+            right: 20px;
+            background: rgba(255, 255, 255, 0.9);
+            backdrop-filter: blur(10px);
+            padding: 10px;
+            border-radius: 8px;
+            box-shadow: 0 2px 10px rgba(0, 0, 0, 0.1);
+            z-index: 100;
+            display: flex;
+            gap: 15px;
+            align-items: center;
+        }
+
+        body[data-theme="dark"] .toolbar {
+            background: rgba(40, 40, 40, 0.9);
+            color: white;
+        }
+
+        .toolbar button {
+            border: none;
+            background: none;
+            cursor: pointer;
+            font-size: 1.2rem;
+            padding: 5px;
+            border-radius: 4px;
+            color: inherit;
+        }
+
+        .toolbar button:hover {
+            background: rgba(0, 0, 0, 0.1);
+        }
+
+        .toolbar select {
+            font-size: 1rem;
+            padding: 4px;
+            border-radius: 4px;
+            border: 1px solid #ccc;
+        }
+
+        .back-btn {
+            position: fixed;
+            top: 20px;
+            left: 20px;
+            width: 40px;
+            height: 40px;
+            background: var(--bg-body);
+            border: 1px solid #ccc;
+            border-radius: 50%;
+            cursor: pointer;
+            z-index: 100;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 1.2rem;
+            color: var(--text-color);
+            box-shadow: 0 2px 5px rgba(0, 0, 0, 0.1);
+        }
+
+        /* Main Reader Container */
+        #viewerContainer {
+            max-width: 740px;
+            margin: 0 auto;
+            padding: 60px 20px 100px;
+            min-height: 100vh;
+        }
+
+        /* PDF Styles */
+        .pdf-page {
+            margin-bottom: 20px;
+            position: relative;
+            box-shadow: 0 2px 8px rgba(0, 0, 0, 0.05);
+            background: white;
+        }
+
+        /* In dark mode, dim the PDF pages slightly */
+        body[data-theme="dark"] .pdf-page {
+            filter: brightness(0.8) contrast(1.2);
+        }
+
+        /* EPUB Styles */
+        /* epub.js puts its own iframe, we style the container */
+    </style>
+</head>
+
+<body>
+
+    <div id="readingProgress"></div>
+
+    <button class="back-btn" onclick="goBack()">←</button>
+
+    <div class="toolbar">
+        <button onclick="zoomOut()">A-</button>
+        <button onclick="zoomIn()">A+</button>
+        <button onclick="cycleTheme()">🎨</button>
+    </div>
+
+    <div id="viewerContainer"></div>
+
+
+    <script>
+        // --- SETUP ---
+        const urlParams = new URLSearchParams(window.location.search);
+        const id = urlParams.get("id");
+
+        let books = JSON.parse(localStorage.getItem("books")) || [];
+        let book = books.find(b => b.id === id);
+
+        if (!book) window.location.href = "index.html";
+
+        // Global State
+        let currentScale = 1.0; // Font scale or PDF scale
+        let pdfDoc = null;
+        let epubBook = null;
+        let rendition = null;
+
+        // Themes
+        const themes = ['light', 'sepia', 'dark'];
+        let currentThemeIndex = 0;
+
+        // Init
+        document.title = book.name;
+
+        // Restore Settings
+        if (localStorage.getItem('readerTheme')) {
+            document.body.setAttribute('data-theme', localStorage.getItem('readerTheme'));
+            currentThemeIndex = themes.indexOf(localStorage.getItem('readerTheme'));
+            if (currentThemeIndex < 0) currentThemeIndex = 0;
+        }
+
+        async function init() {
+            try {
+                const fileBlob = await getFile(book.id);
+                if (!fileBlob) throw new Error("File not found");
+
+                if (book.fileType === 'epub') {
+                    initEpub(fileBlob);
+                } else {
+                    initPDF(fileBlob);
+                }
+            } catch (e) {
+                console.error(e);
+                alert("Error loading book");
+            }
+        }
+
+        // --- PDF ENGINE (Continuous + Lazy Load) ---
+        async function initPDF(blob) {
+            const url = URL.createObjectURL(blob);
+            pdfDoc = await pdfjsLib.getDocument(url).promise;
+            book.totalPages = pdfDoc.numPages;
+
+            const container = document.getElementById("viewerContainer");
+
+            // Create placeholders for all pages
+            for (let i = 1; i <= pdfDoc.numPages; i++) {
+                let wrapper = document.createElement("div");
+                wrapper.className = "pdf-page";
+                wrapper.dataset.pageNumber = i;
+                wrapper.style.minHeight = "800px"; // approximate placeholder
+                container.appendChild(wrapper);
+            }
+
+            // Setup Intersection Observer for lazy loading
+            const observer = new IntersectionObserver((entries) => {
+                entries.forEach(entry => {
+                    if (entry.isIntersecting) {
+                        renderPDFPage(entry.target);
+                        observer.unobserve(entry.target); // render once
+                    }
+                });
+            }, { rootMargin: "200px" });
+
+            document.querySelectorAll('.pdf-page').forEach(page => observer.observe(page));
+
+            // Restore Scroll Position
+            if (book.lastScrollPosition) {
+                setTimeout(() => window.scrollTo(0, book.lastScrollPosition), 500);
+            }
+
+            // Scroll Listener for Progress
+            window.addEventListener('scroll', onScroll);
+        }
+
+        async function renderPDFPage(wrapper) {
+            const pageNum = parseInt(wrapper.dataset.pageNumber);
+            const page = await pdfDoc.getPage(pageNum);
+
+            // Calculate scale to fit width (max 700px)
+            // But user might want zoom. Let's start with width-fit.
+            const viewportRaw = page.getViewport({ scale: 1.0 });
+            const desiredWidth = Math.min(700, window.innerWidth - 40) * (currentScale + 0.5);
+            // base scale 1.5 roughly covers high DPI, adjusting with currentScale
+
+            const scale = desiredWidth / viewportRaw.width;
+            const viewport = page.getViewport({ scale: scale });
+
+            const canvas = document.createElement("canvas");
+            canvas.height = viewport.height;
+            canvas.width = viewport.width;
+            // Style width to keep it responsive
+            canvas.style.width = "100%";
+            canvas.style.height = "auto";
+
+            wrapper.innerHTML = "";
+            wrapper.appendChild(canvas);
+            wrapper.style.minHeight = "auto";
+
+            const ctx = canvas.getContext('2d');
+            await page.render({ canvasContext: ctx, viewport: viewport }).promise;
+        }
+
+        // --- EPUB ENGINE (Continuous Flow) ---
+        function initEpub(blob) {
+            epubBook = ePub(blob);
+            rendition = epubBook.renderTo("viewerContainer", {
+                flow: "scrolled-doc", // Continuous scroll
+                width: "100%",
+                height: "auto"
+            });
+
+            rendition.display(book.lastScrollCFI || undefined);
+
+            rendition.themes.default({
+                "p": { "font-family": "Merriweather", "font-size": "18px", "line-height": "1.8" },
+                "img": { "max-width": "100%" }
+            });
+
+            applyThemeToEpub();
+
+            // Progress tracking in EPUB is tricky in scrolled-doc. 
+            // We rely on 'relocated' to get CFI, but global scroll event acts on the window.
+            rendition.on("relocated", (location) => {
+                book.lastScrollCFI = location.start.cfi;
+                // approximate progress
+                const percent = location.start.percentage;
+                updateProgressVisual(percent * 100);
+                saveState();
+            });
+        }
+
+
+        // --- COMMON LOGIC ---
+        function onScroll() {
+            // PDF Progress
+            if (book.fileType !== 'epub') {
+                const scrollTop = window.scrollY;
+                const docHeight = document.body.scrollHeight - window.innerHeight;
+                const percent = (scrollTop / docHeight) * 100;
+
+                updateProgressVisual(percent);
+                book.lastScrollPosition = scrollTop;
+
+                if (percent > 90) {
+                    book.status = 'completed';
+                } else if (percent < 5) {
+                    book.status = 'to-read';
+                } else {
+                    book.status = 'in-progress';
+                }
+
+                // Debounce save
+                clearTimeout(window.saveTimeout);
+                window.saveTimeout = setTimeout(saveState, 1000);
+            }
+        }
+
+        function updateProgressVisual(percent) {
+            document.getElementById("readingProgress").style.width = Math.min(100, Math.max(0, percent)) + "%";
+            book.progressPercent = Math.round(percent);
+        }
+
+        function saveState() {
+            book.lastReadDate = Date.now();
+
+            // Update in main array
+            const idx = books.findIndex(b => b.id === book.id);
+            if (idx !== -1) books[idx] = book;
+
+            localStorage.setItem("books", JSON.stringify(books));
+        }
+
+        // --- UI ACTIONS ---
+        function zoomIn() {
+            currentScale += 0.2;
+            if (book.fileType === 'epub') {
+                rendition.themes.fontSize(`${18 * currentScale}px`);
+            } else {
+                // PDF re-render needed. Simple reload for now or re-render visible.
+                // For simplicity, just reload page to re-calculate widths.
+                location.reload();
+            }
+        }
+
+        function zoomOut() {
+            currentScale -= 0.2;
+            if (currentScale < 0.5) currentScale = 0.5;
+            if (book.fileType === 'epub') {
+                rendition.themes.fontSize(`${18 * currentScale}px`);
+            } else {
+                location.reload();
+            }
+        }
+
+        function cycleTheme() {
+            currentThemeIndex = (currentThemeIndex + 1) % themes.length;
+            const theme = themes[currentThemeIndex];
+            document.body.setAttribute('data-theme', theme);
+            localStorage.setItem('readerTheme', theme);
+
+            if (book.fileType === 'epub') applyThemeToEpub();
+        }
+
+        function applyThemeToEpub() {
+            if (!epubBook) return;
+            const theme = themes[currentThemeIndex];
+            if (theme === 'dark') {
+                rendition.themes.register("dark", {
+                    "body": { "background": "#1a1a1a", "color": "#d3d3d3" }
+                });
+                rendition.themes.select("dark");
+            } else if (theme === 'sepia') {
+                rendition.themes.register("sepia", {
+                    "body": { "background": "#f4ecd8", "color": "#5b4636" }
+                });
+                rendition.themes.select("sepia");
+            } else {
+                rendition.themes.register("light", {
+                    "body": { "background": "#fdfdfd", "color": "#333" }
+                });
+                rendition.themes.select("light");
+            }
+        }
+
+        function goBack() {
+            saveState();
+            window.location.href = "index.html";
+        }
+
+        init();
+    </script>
+</body>
+
+</html>
